@@ -1,1 +1,100 @@
-# NovelFraph: 小说知识图谱与混合RAG系统 基于《鬼吹灯》《斗罗大陆》等小说，自动构建人物-地点-组织关系知识图谱并支持自然语言问答。
+# NovelFraph: 小说知识图谱与混合RAG系统
+
+基于本项目可以把小说文本抽取为三元组（实体-关系-实体），并写入 Neo4j 图数据库，支持后续基于图的问答（Graph RAG）。
+
+下面为本次提交的主要改动与使用说明（2025-10-25）：
+
+## 本次主要改动
+- 抽取器增强（`src/ingestion/extractor.py`）
+	- 优先调用 OpenAI 兼容接口（可指向本地 qwen/vLLM 服务）进行三元组抽取，要求 LLM 输出 JSON 数组（[{"head","rel","tail"}, ...]）。
+	- 增加请求重试（2 次）和长文本分段处理（基于段落/标点/固定长度拆分），对每段进行抽取并合并去重。
+	- 若 LLM 不可用或解析失败，回退到原有基于正则的规则抽取器。
+
+- Neo4j 写入增强（`src/ingestion/neo4j_loader.py`）
+	- `load_triples` 接受可选元数据：`series`, `source_file`, `ts`。
+	- 写入时为节点/关系添加 `created_at`、`series`、`source_file`、`ts` 等属性，便于审计与查询。
+
+- API 增强（`src/api/main.py`）
+	- `POST /ingest`：接收 JSON 文本并保存原文到 `data/raw/<series>/`（时间戳+hash/filename），触发抽取并写入 Neo4j，响应包含 `saved_path`。
+	- 新增 `POST /upload-file`：支持 multipart/form-data 上传文件，自动保存到 `data/raw/<series>/` 并触发抽取与写入，返回三元组与保存路径。
+
+## 快速使用说明
+
+1) 启动依赖服务
+
+	- 启动 Neo4j（示例，系统安装路径可能不同）：
+
+		```bash
+		NEO4J_CONF=/etc/neo4j /usr/share/neo4j/bin/neo4j start
+		# 检查端口
+		ss -tuln | egrep '7474|7687'
+		# 验证连接
+		cypher-shell --non-interactive --encryption=false -a bolt://localhost:7687 -u neo4j -p '<password>' "RETURN 1;"
+		```
+
+	- 启动本地 qwen/vLLM（可选，示例：模型已部署在本机并监听 8001）：
+
+		```bash
+		# 假设你已用 vllm 启动 OpenAI 兼容 API
+		export OPENAI_API_BASE=http://127.0.0.1:8001/v1
+		export OPENAI_API_KEY=EMPTY
+		```
+
+2) 启动后端 API
+
+	```bash
+	# 从项目根
+	export PYTHONPATH=$(pwd)/src:$PYTHONPATH
+	uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+	```
+
+3) 上传小说并自动抽取（两种方式）
+
+	- 方式 A：使用 `POST /upload-file` 上传文件（推荐）
+
+		```bash
+		curl -X POST "http://127.0.0.1:8000/upload-file" \
+			-F "series=鬼吹灯" \
+			-F "file=@/path/to/mybook.txt"
+		```
+
+		返回示例：
+		```json
+		{
+			"series": "鬼吹灯",
+			"triples_extracted": 2,
+			"triples": [["胡八一","人物关系:同伴","王凯旋"],["胡八一","位于","精绝古城"]],
+			"saved_path": "/root/novel-graph-rag-toy-project1-/data/raw/鬼吹灯/20251025T..._mybook.txt"
+		}
+		```
+
+	- 方式 B：使用 `POST /ingest` 直接传 JSON 文本（会保存到 data/raw 并触发抽取）
+
+		```bash
+		curl -X POST "http://127.0.0.1:8000/ingest" -H "Content-Type: application/json" \
+			-d '{"text": "胡八一与王凯旋是同伴。胡八一在精绝古城。", "series": "鬼吹灯"}'
+		```
+
+4) 在 Neo4j 中查看写入结果
+
+	```bash
+	cypher-shell -u neo4j -p '<password>' "MATCH (a)-[r]->(b) RETURN a.name, type(r), r.type, r.series, r.source_file, b.name LIMIT 50;"
+	```
+
+## 提示与注意事项
+
+- LLM 抽取提示：本项目要求 LLM 输出为 JSON 数组（每个元素包含 head/rel/tail），不同模型行为会有差异。若你使用本地 qwen，请在环境变量中设置 `OPENAI_API_BASE` 指向你的 vLLM OpenAI 兼容端点（例如 `http://127.0.0.1:8001/v1`），并设置 `OPENAI_API_KEY`（若需要）。
+
+- 长文本处理：抽取器会自动把长文本分段并合并去重；对于整本小说建议使用 `POST /upload-file` 分章节上传或先分章上传以减少 prompt 影响并便于溯源。
+
+- 元数据：写入 Neo4j 时会带 `series`、`source_file`、`ts` 字段，有助于按书籍/来源过滤和回溯。
+
+## 后续改进建议（可选）
+
+- 为抽取增加实体归一化（例如把“老胡”归一为“胡八一”）与别名管理。
+- 根据实体类别（Person/Location/Event）创建不同节点标签，改进 Cypher 写入与后续图查询效率。
+- 为 LLM 抽取添加更完善的重试/超时监控与日志（将日志落盘到 `logs/`）。
+
+---
+
+更多使用细节可查看 `src/api/main.py`、`src/ingestion/extractor.py`、`src/ingestion/neo4j_loader.py` 的实现（代码中含有快速示例与注释）。
