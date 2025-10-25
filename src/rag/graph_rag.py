@@ -30,9 +30,12 @@ def _build_chain_if_possible():
 
     try:
         # 延迟导入（避免没装 LLM 依赖时导入即报错）
-        from langchain.graphs import Neo4jGraph
-        from langchain.chains import GraphCypherQAChain
-        from langchain_community.chat_models import ChatOpenAI
+        from langchain_community.graphs import Neo4jGraph
+        # GraphCypherQAChain 新位置（0.3.x）
+        #from langchain.chains.graph_qa.cypher import GraphCypherQAChain
+        from langchain_community.chains.graph_qa.cypher import GraphCypherQAChain
+        # OpenAI 兼容（本地 vLLM）
+        from langchain_openai import ChatOpenAI
 
         # 读取 LLM 配置（支持：官方 OpenAI 或 vLLM 的 OpenAI 兼容服务）
         openai_api_base = os.getenv("OPENAI_API_BASE")  # 例如 http://127.0.0.1:8001/v1
